@@ -1,8 +1,10 @@
 package io.jeffrey.swam.workflows;
 
+import io.jeffrey.swam.WorkflowStatusLog;
 import io.jeffrey.swam.amazon.HostingRegion;
 import io.jeffrey.swam.amazon.Universe;
 
+import java.io.ByteArrayInputStream;
 import java.util.Collections;
 
 import com.amazonaws.services.route53.model.AliasTarget;
@@ -22,7 +24,11 @@ import com.amazonaws.services.route53.model.ResourceRecord;
 import com.amazonaws.services.route53.model.ResourceRecordSet;
 import com.amazonaws.services.s3.model.AmazonS3Exception;
 import com.amazonaws.services.s3.model.BucketWebsiteConfiguration;
+import com.amazonaws.services.s3.model.CannedAccessControlList;
+import com.amazonaws.services.s3.model.ObjectMetadata;
+import com.amazonaws.services.s3.model.PutObjectRequest;
 import com.amazonaws.services.s3.model.RedirectRule;
+import com.amazonaws.services.s3.model.StorageClass;
 
 /**
  * Experimental workflow for creating a website with Route53 and S3.
@@ -42,12 +48,14 @@ public class CreateWebsiteWorkflow {
     Website, Redirect
   }
 
+  private final WorkflowStatusLog log;
   private final Universe universe;
 
   /**
    * @param universe all things Amazon
    */
-  public CreateWebsiteWorkflow(final Universe universe) {
+  public CreateWebsiteWorkflow(final WorkflowStatusLog log, final Universe universe) {
+    this.log = log;
     this.universe = universe;
   }
 
@@ -83,19 +91,57 @@ public class CreateWebsiteWorkflow {
   }
 
   /**
+   * does the bucket need the given asset (i.e. it is gone and required)
+   */
+  private boolean needsAsset(final String bucket, String uri, IdealizedBucketConfig status) {
+    log.log("needsAsset", "bucket=", bucket, "uri=", uri);
+    if (status != IdealizedBucketConfig.Website) {
+      log.log("needsAsset", "does not require asset");
+      return false;
+    }
+    try {
+      log.log("needsAsset", "checking asset exists");
+      universe.s3.getObject(bucket, uri);
+      return false;
+    } catch (AmazonS3Exception e) {
+      if (e.getErrorCode().equalsIgnoreCase("NoSuchKey")) {
+        log.log("needsAsset", "asset does not exist, will need to create it");
+        return true;
+      } else {
+        return false;
+      }
+    }
+  }
+
+  /**
+   * upload html to a bucket 
+   */
+  private void uploadHTML(String bucket, String uri, String body) throws Exception {
+    log.log("uploadHTML", "bucket=", bucket, "uri=", uri, "body=", body);
+    byte[] bytes = body.getBytes("UTF-8");
+    ByteArrayInputStream stream = new ByteArrayInputStream(bytes);
+    ObjectMetadata metadata = new ObjectMetadata();
+    metadata.setContentLength(bytes.length);
+    metadata.setContentType("text/html");
+    PutObjectRequest request = new PutObjectRequest(bucket, uri, stream, metadata);
+    request.setCannedAcl(CannedAccessControlList.PublicRead);
+    request.setStorageClass(StorageClass.ReducedRedundancy);
+    universe.s3.putObject(request);
+
+  }
+
+  /**
    * attempt to configure the bucket with a new website configuration
    */
   private void configureBucket(final String bucket, final IdealizedBucketConfig status, final String primaryDomain) {
-    final BucketWebsiteConfiguration config = universe.s3.getBucketWebsiteConfiguration(bucket);
-    // it already configured, don't touch it
-    if (config != null) {
-      return;
-    }
+    log.log("configureBucket", "bucket=", bucket);
     final BucketWebsiteConfiguration configuration = new BucketWebsiteConfiguration();
     if (status == IdealizedBucketConfig.Website) {
+      log.log("configureBucket", "bucket=", bucket, "primary");
       configuration.setIndexDocumentSuffix("index.html");
       configuration.setErrorDocument("error.html");
     } else {
+      log.log("configureBucket", "bucket=", bucket, "redirect;to=", primaryDomain);
       final RedirectRule rule = new RedirectRule();
       rule.setHostName(primaryDomain);
       rule.setHttpRedirectCode("301");
@@ -103,27 +149,46 @@ public class CreateWebsiteWorkflow {
     }
     universe.s3.setBucketWebsiteConfiguration(bucket, configuration);
   }
+  
+  private void uploadAssets(String bucket, final IdealizedBucketConfig status) throws Exception {
+    if (needsAsset(bucket, "index.html", status)) {
+      String html = "<html><head></head><body>Hello World!</body></html>";
+      uploadHTML(bucket, "index.html", html);
+    }
+    if (needsAsset(bucket, "error.html", status)) {
+      String html = "<html><head></head><body>ERROR</body></html>";
+      uploadHTML(bucket, "error.html", html);
+    }
+  }
 
   /**
    * Create a domain using Route53 and S3
    */
-  public void create(final String domain, final HostingRegion region) {
+  public void setupDomain(final String domain, final HostingRegion region) throws Exception {
     if (region == null) {
       throw new NullPointerException("region is null");
     }
     if (domain == null) {
       throw new NullPointerException("domain is null");
     }
+    log.log("setupDomain", "start", "domain=", domain, "region=", region.s3Domain);
 
     // step 1: set up DNS
+    log.log("setupDomain", "stage=", "ensureHostedZoneExists");
     final HostedZone zone = ensureHostedZoneExists(domain);
 
     // step 2: set up S3 buckets and make websites
+    log.log("setupDomain", "stage=", "setupBuckets");
     setupBuckets(domain, region);
 
     // step 3: link route53 to s3
+    log.log("setupDomain", "stage=", "linkApex");
     linkApex(domain, zone, region);
+
+    log.log("setupDomain", "stage=", "linkByCname");
     linkByCname("www." + domain, zone, region);
+
+    log.log("setupDomain", "end");
   }
 
   /**
@@ -181,6 +246,7 @@ public class CreateWebsiteWorkflow {
    * Find a ResourceRecordSet with a specific name for a specific type
    */
   private ResourceRecordSet findRR(final String domain, final String type, final HostedZone zone) {
+    log.log("findRR", "domain=", domain, "type=", type);
     final ListResourceRecordSetsRequest request = new ListResourceRecordSetsRequest();
     request.setHostedZoneId(zone.getId());
     request.setStartRecordName(domain + ".");
@@ -238,7 +304,8 @@ public class CreateWebsiteWorkflow {
   /**
    * ensure the buckets exist and are configured appropriately. If both of the buckets are new
    */
-  private void setupBuckets(final String domain, final HostingRegion region) {
+  private void setupBuckets(final String domain, final HostingRegion region) throws Exception {
+    log.log("setupBuckets", "domain=", domain);
     final String wwwDomain = "www." + domain;
     ensureCriticalBucketsExist(domain, region);
     ensureCriticalBucketsExist(wwwDomain, region);
@@ -247,13 +314,22 @@ public class CreateWebsiteWorkflow {
     final IdealizedBucketConfig apexStatus;
     final String primaryDomain;
     if (wwwStatus == IdealizedBucketConfig.Website) {
+      log.log("setupBuckets", "www is a website");
       apexStatus = classify(domain, IdealizedBucketConfig.Redirect);
+      if (apexStatus == IdealizedBucketConfig.Website) {
+        log.log("setupBuckets", "apex is a website");
+      } else {
+        log.log("setupBuckets", "apex is redirect");
+      }
       primaryDomain = wwwDomain;
     } else {
+      log.log("setupBuckets", "www is a redirect");
       apexStatus = IdealizedBucketConfig.Website;
       primaryDomain = domain;
     }
     configureBucket(domain, apexStatus, primaryDomain);
     configureBucket(wwwDomain, wwwStatus, primaryDomain);
+    uploadAssets(domain,  apexStatus);
+    uploadAssets(wwwDomain,  wwwStatus);
   }
 }
